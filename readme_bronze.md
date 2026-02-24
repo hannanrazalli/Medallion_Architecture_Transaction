@@ -1,154 +1,151 @@
-# BRONZE LAYER - ENTERPRISE LEVEL
+# BRONZE LAYER - ENTERPRISE INCREMENTAL (AUTO LOADER)
 
 import logging
-from pyspark.sql import SparkSession, functions as F, types as T
-from delta.tables import DeltaTable
 from datetime import datetime
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession, functions as F
 
-# -------------------------
-# 1. LOGGING
-# -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# -------------------------
-# 2. UTILITY FUNCTIONS
-# -------------------------
-def path_exists(path: str) -> bool:
-    try:
-        dbutils.fs.ls(path)
-        return True
-    except Exception:
-        return False
+# --------------------------------------------------------------------------------------
+# PHASE 1: CONFIGURATION
+# --------------------------------------------------------------------------------------
+bronze_config = {
+    "table_name" : "workspace.default.bronze_transactions",
+    "source_path" : "/Volumes/workspace/default/raw_volume/transactions_batch_1/",
+    "checkpoint_path" : "/Volumes/workspace/default/checkpoints/bronze_transactions/",
+    "batch_id" : f"BATCH_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    "schema" : "amount double, cust_id long, is_member boolean, points int, status string, txn_date string, txn_id string",
+    "repartition_num" : 5,
+    "log_table" : {
+        "batch" : "workspace.default.batch_control",
+        "sla" : "workspace.default.sla_metrics"
+    }}
 
-def add_audit_columns(df, batch_id):
-    # _source_file safely
-    if "_metadata" in df.columns:
-        df = df.select("*", "_metadata") \
-               .withColumn("_source_file", F.col("_metadata.file_path")) \
-               .drop("_metadata")
+# --------------------------------------------------------------------------------------
+# PHASE 2: UNIVERSAL HELPERS & AUDIT LOGIC
+# --------------------------------------------------------------------------------------
+def upsert_log_table(spark, table_name, schema, data, merge_keys):
+    df = spark.createDataFrame(data, schema)
+    if not spark.catalog.tableExists(table_name):
+        df.write.format("delta").mode("overwrite").saveAsTable(table_name)
     else:
-        df = df.withColumn("_source_file", F.lit(None).cast("string"))
+        dt = DeltaTable.forName(spark, table_name)
+        condition = " AND ".join([f"t.{k} = s.{k}" for k in merge_keys])
+        (dt.alias("t").merge(df.alias("s"), condition)
+         .whenMatchedUpdateAll()
+         .whenNotMatchedInsertAll()
+         .execute())
+        
+def add_audit_col(df, batch_id):
+    # Metadata file path disediakan secara automatik oleh Auto Loader
+    src_col = F.col("_metadata.file_path") if "_metadata" in df.columns else F.lit("UNKNOWN")
+    
+    corrupt_logic = F.when(F.col("_corrupt_record").isNotNull(), F.lit("CORRUPT")).otherwise(F.lit("CLEAN"))
 
-    return (df.withColumn("_ingested_at", F.current_timestamp())
+    return (df.withColumn("_source_path", src_col)
+              .withColumn("_ingest_at", F.current_timestamp())
               .withColumn("_batch_id", F.lit(batch_id))
-              .withColumn("_ingest_date", F.to_date(F.to_timestamp("txn_date", "yyyy-MM-dd HH:mm:ss"))))
+              .withColumn("_ingest_date", F.current_date()) 
+              .withColumn("_record_status", corrupt_logic))
 
-def update_batch_control(batch_id, layer, status):
-    """Senior DE mindset: track all batch runs even if single batch"""
-    table_name = "workspace.default.batch_control"
-    now = datetime.now()
-    data = [(batch_id, layer, status, now)]
-    schema = T.StructType([
-        T.StructField("batch_id", T.StringType()),
-        T.StructField("layer", T.StringType()),
-        T.StructField("status", T.StringType()),
-        T.StructField("processed_at", T.TimestampType())
-    ])
-    df = spark.createDataFrame(data, schema)
-    if not spark.catalog.tableExists(table_name):
-        df.write.format("delta").mode("overwrite").saveAsTable(table_name)
-    else:
-        delta_obj = DeltaTable.forName(spark, table_name)
-        (delta_obj.alias("t")
-         .merge(df.alias("s"), "t.batch_id = s.batch_id AND t.layer = s.layer")
-         .whenNotMatchedInsertAll()
-         .execute())
-
-def update_sla_metrics(batch_id, layer, total_rows, clean_rows, quarantine_rows, status):
-    """Senior DE mindset: SLA metrics"""
-    table_name = "workspace.default.sla_metrics"
-    now = datetime.now()
-    data = [(batch_id, layer, total_rows, clean_rows, quarantine_rows, status, now)]
-    schema = T.StructType([
-        T.StructField("batch_id", T.StringType()),
-        T.StructField("layer", T.StringType()),
-        T.StructField("total_rows", T.LongType()),
-        T.StructField("clean_rows", T.LongType()),
-        T.StructField("quarantine_rows", T.LongType()),
-        T.StructField("status", T.StringType()),
-        T.StructField("processed_at", T.TimestampType())
-    ])
-    df = spark.createDataFrame(data, schema)
-    if not spark.catalog.tableExists(table_name):
-        df.write.format("delta").mode("overwrite").saveAsTable(table_name)
-    else:
-        delta_obj = DeltaTable.forName(spark, table_name)
-        (delta_obj.alias("t")
-         .merge(df.alias("s"), "t.batch_id = s.batch_id AND t.layer = s.layer")
-         .whenNotMatchedInsertAll()
-         .execute())
-
-# -------------------------
-# 3. CORE ENGINE
-# -------------------------
-def run_bronze_ingestion(spark_session, config):
+# --------------------------------------------------------------------------------------
+# PHASE 3: CORE BRONZE ENGINE (AUTO LOADER - CLEAN ENTERPRISE VERSION)
+# --------------------------------------------------------------------------------------
+def bronze_ingestion(spark, config):
     table_name = config['table_name']
     source_path = config['source_path']
-    batch_id = config['batch_id']
-    repartition_num = config.get("repartition_num", 5)
+    checkpoint_path = config['checkpoint_path']
+    run_batch_id = config['batch_id']
+    full_schema = f"{config['schema']}, _corrupt_record string"
     
-    logger.info(f"Starting Bronze ingestion: {table_name}, batch {batch_id}")
+    batch_table, sla_table = config['log_table']['batch'], config['log_table']['sla']
+    batch_schema = "batch_id string, layer string, status string, processed_at timestamp"
+    sla_schema = "batch_id string, layer string, total_rows long, clean_rows long, quarantine_rows long, status string, processed_at timestamp"
 
-    update_batch_control(batch_id, "bronze", "STARTED")
+    logging.info(f"Starting Auto Loader Bronze: {table_name}")
+    upsert_log_table(spark, batch_table, batch_schema, [(run_batch_id, "BRONZE", "STARTED", datetime.now())], ["batch_id", "layer"])
+    
     try:
-        if not path_exists(source_path):
-            raise ValueError(f"Source path does not exist: {source_path}")
+        # ======================================================================
+        # LANGKAH 1: DEFINISIKAN LOGIK PROSES (Micro-Batch Action)
+        # ======================================================================
+        def merge_to_delta(micro_batch_df, stream_batch_id):
+            if micro_batch_df.isEmpty(): 
+                return
+            
+            logging.info(f"Processing new files for stream batch: {stream_batch_id}")
+            df_final = add_audit_col(micro_batch_df, run_batch_id)
 
-        df = (spark_session.read
-              .format("json")
-              .schema(config['schema'])
-              .option("mode", "FAILFAST")
-              .load(source_path))
+            if not spark.catalog.tableExists(table_name):
+                (df_final.repartition(config.get("repartition_num", 5))
+                         .write.format("delta")
+                         .partitionBy("_ingest_date")
+                         .saveAsTable(table_name))
+            else:
+                condition = "t.txn_id = s.txn_id AND t._batch_id = s._batch_id AND t._ingest_date = s._ingest_date"
+                (DeltaTable.forName(spark, table_name).alias("t")
+                           .merge(df_final.alias("s"), condition)
+                           .whenNotMatchedInsertAll()
+                           .execute())
 
-        df_with_meta = add_audit_columns(df, batch_id)
+        # ======================================================================
+        # LANGKAH 2: BACA FAIL BARU (Auto Loader cloudFiles)
+        # ======================================================================
+        logging.info(f"Scanning for new files in: {source_path}")
+        stream_df = (spark.readStream.format("cloudFiles")
+                          .option("cloudFiles.format", "json")
+                          .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema")
+                          .option("cloudFiles.useIncrementalListing", "true")
+                          .schema(full_schema)
+                          .load(source_path)
+                          .select("*", "_metadata"))
 
-        if not spark_session.catalog.tableExists(table_name):
-            (df_with_meta.repartition(repartition_num)
-             .write.format("delta")
-             .mode("overwrite")
-             .partitionBy("_ingest_date")
-             .saveAsTable(table_name))
+        # ======================================================================
+        # LANGKAH 3: JALANKAN PIPELINE (Trigger AvailableNow)
+        # ======================================================================
+        logging.info("Executing stream in Batch Mode...")
+        query = (stream_df.writeStream
+                          .foreachBatch(merge_to_delta)
+                          .option("checkpointLocation", f"{checkpoint_path}/data")
+                          .trigger(availableNow=True)
+                          .start())
+        
+        query.awaitTermination() # Tahan code di sini sampai stream siap proses semua fail
+
+        # ======================================================================
+        # LANGKAH 4: KIRA SLA & LOG SUCCESS
+        # ======================================================================
+        logging.info("Calculating SLA metrics...")
+        
+        if spark.catalog.tableExists(table_name):
+            df_res = (spark.table(table_name)
+                           .filter(F.col("_batch_id") == run_batch_id)
+                           .groupBy("_record_status")
+                           .count()
+                           .collect())
+            stats = {r["_record_status"]: r["count"] for r in df_res}
+            total_rows, clean_rows, quarantine_rows = sum(stats.values()), stats.get("CLEAN", 0), stats.get("CORRUPT", 0)
         else:
-            delta_obj = DeltaTable.forName(spark_session, table_name)
-            (delta_obj.alias("t")
-             .merge(df_with_meta.alias("s"),
-                    "t.txn_id = s.txn_id AND t._batch_id = s._batch_id")
-             .whenNotMatchedInsertAll()
-             .execute())
+            total_rows, clean_rows, quarantine_rows = 0, 0, 0
+            logging.info("Table does not exist yet (No files were processed).")
 
-        total_rows = df_with_meta.count()
-        clean_rows = total_rows
-        quarantine_rows = 0
-
-        update_sla_metrics(batch_id, "bronze", total_rows, clean_rows, quarantine_rows, "SUCCESS")
-        update_batch_control(batch_id, "bronze", "SUCCESS")
-        logger.info("Bronze ingestion complete")
-        df_with_meta.show(5, truncate=False)
+        upsert_log_table(spark, batch_table, batch_schema,
+                         [(run_batch_id, "BRONZE", "SUCCESS", datetime.now())], ["batch_id", "layer"])
+        upsert_log_table(spark, sla_table, sla_schema,
+                         [(run_batch_id, "BRONZE", total_rows, clean_rows, quarantine_rows, "SUCCESS", datetime.now())], ["batch_id", "layer"])
+        logging.info(f"Bronze completed. Total: {total_rows}, Clean: {clean_rows}, Corrupt: {quarantine_rows}")
 
     except Exception as e:
-        update_batch_control(batch_id, "bronze", "FAILED")
-        update_sla_metrics(batch_id, "bronze", 0, 0, 0, "FAILED")
-        logger.error(f"Bronze ingestion failed: {e}")
-        raise
+        upsert_log_table(spark, batch_table, batch_schema,
+                         [(run_batch_id, "BRONZE", "FAILED", datetime.now())], ["batch_id", "layer"])
+        upsert_log_table(spark, sla_table, sla_schema,
+                         [(run_batch_id, "BRONZE", 0, 0, 0, "FAILED", datetime.now())], ["batch_id", "layer"])
+        logging.error(f"Bronze failed: {e}")
+        raise e
 
-# -------------------------
-# 4. CONFIG & EXECUTION
-# -------------------------
-pipeline_config = {
-    "table_name": "workspace.default.bronze_transactions",
-    "source_path": "/Volumes/workspace/default/raw_volume/transactions_batch_1",
-    "batch_id": "BATCH_2026_02",
-    "schema": T.StructType([
-        T.StructField("txn_id", T.StringType(), True),
-        T.StructField("cust_id", T.LongType(), True),
-        T.StructField("amount", T.DoubleType(), True),
-        T.StructField("points", T.IntegerType(), True),
-        T.StructField("is_member", T.BooleanType(), True),
-        T.StructField("status", T.StringType(), True),
-        T.StructField("txn_date", T.StringType(), True)
-    ]),
-    "repartition_num": 5
-}
-
-run_bronze_ingestion(spark, pipeline_config)
+# --------------------------------------------------------------------------------------
+# PHASE 4: EXECUTION
+# --------------------------------------------------------------------------------------
+bronze_ingestion(spark, bronze_config)
