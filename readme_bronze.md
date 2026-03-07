@@ -69,8 +69,9 @@ def bronze_ingestion(spark, config):
     batch_schema = "batch_id STRING, layer STRING, status STRING, processed_at TIMESTAMP"
     sla_schema = "batch_id STRING, layer STRING, total_rows LONG, clean_rows LONG, quarantine_rows LONG, status STRING, processed_at TIMESTAMP"
 
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {batch_table} (batch_id STRING, layer STRING, status STRING, processed_at TIMESTAMP) USING DELTA")
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {sla_table} (batch_id STRING, layer STRING, total_rows LONG, clean_rows LONG, quarantine_rows LONG, status STRING, processed_at TIMESTAMP) USING DELTA")
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {batch_table} ({batch_schema}) USING DELTA")
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {sla_table} ({sla_schema}) USING DELTA")
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {table_name} ({full_schema}) USING DELTA")
 
     logger.info(f"[START] Starting Auto Loader Batch: {run_batch_id}")
     
@@ -82,6 +83,8 @@ def bronze_ingestion(spark, config):
         # LANGKAH 1: FOREACHBATCH (WRITE DATA & UPDATE SLA SERENTAK)
         # ======================================================================
         def merge_to_delta(micro_batch_df, stream_batch_id):
+            if micro_batch_df.isEmpty():
+                return
             df_final = add_audit_col(micro_batch_df, run_batch_id)
 
             # A. TULIS KE BRONZE TABLE
